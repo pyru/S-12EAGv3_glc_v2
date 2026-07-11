@@ -104,3 +104,9 @@ Verified: `harness/leak_runner.py` leak 2, which previously reported `OPEN -> DE
 `force_pair_owner` (`glc/security/pairing.py`) now checks whether the target channel already has an owner before granting `owner_paired`; if one exists, it raises `PermissionError` unless the deployment operator has explicitly set `GLC_ALLOW_REPAIR_OWNER=1`. This closes the realistic threat (an already-bootstrapped install getting a second, attacker-chosen owner identity slipped in) while still allowing genuine first-run bootstrap, which every existing test and installer flow depends on.
 
 Verified: `harness/leak_runner.py` leak 3 (updated to bootstrap a real owner first, matching the realistic post-install state) now reports `ERROR -> PermissionError: channel 'telegram' already has an owner...` instead of granting the attacker `owner_paired`. `tests/test_pairing.py` adds regression tests for bootstrap-still-works, escalation-now-blocked, and the explicit override.
+
+### Leak 10 — cost-ledger poisoning (invariant 8, named explicitly)
+
+`glc.db.log_call` now validates `input_tokens`, `output_tokens`, `cache_create_tokens`, and `cache_read_tokens` are non-negative integers within a generous plausible bound (5,000,000 — a multiple of the largest configured provider context window) and raises `ValueError` otherwise. This matters beyond data hygiene: `enforce_data_plane_limits` (the C5 fix, invariant 8's other half) computes its budget check from exactly this ledger, so an unvalidated write could previously fake either an exhausted or an artificially-clear budget.
+
+Verified: `harness/leak_runner.py` leak 10, which previously reported `OPEN -> wrote unvalidated ledger row...`, now reports `ERROR -> ValueError: log_call: input_tokens=999999999 is outside the plausible range [0, 5000000]`. `tests/test_cost_ledger.py` covers the accept/reject boundary.

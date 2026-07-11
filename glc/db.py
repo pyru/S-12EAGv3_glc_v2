@@ -72,6 +72,31 @@ def init() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_session_ts ON calls(session, ts DESC)")
 
 
+# Invariant 8: every run must have hard limits on time, tokens, tool
+# calls, and cost. Section 7 leak 10 wrote a row with input_tokens=
+# 999_999_999 straight through — log_call validated nothing, so the
+# cost ledger this invariant's budget checks are computed from
+# (glc.security.auth.enforce_data_plane_limits) could itself be
+# poisoned to fake either an exhausted or an artificially-clear budget.
+# No real provider call is anywhere close to this large; the cap is a
+# generous multiple of the largest configured context window
+# (glc.routing.LIMITS's max_ctx tops out at 1,000,000 for gemini).
+_MAX_PLAUSIBLE_TOKENS = 5_000_000
+
+
+def _check_token_bounds(input_tokens, output_tokens, cache_create_tokens, cache_read_tokens) -> None:
+    for name, value in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("cache_create_tokens", cache_create_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"log_call: {name} must be an int, got {value!r}")
+        if value < 0 or value > _MAX_PLAUSIBLE_TOKENS:
+            raise ValueError(f"log_call: {name}={value} is outside the plausible range [0, {_MAX_PLAUSIBLE_TOKENS}]")
+
+
 def log_call(
     provider,
     model,
@@ -96,6 +121,7 @@ def log_call(
     session=None,
     retries=0,
 ) -> None:
+    _check_token_bounds(input_tokens, output_tokens, cache_create_tokens, cache_read_tokens)
     with conn() as c:
         c.execute(
             """INSERT INTO calls (ts, provider, model, input_tokens, output_tokens,
