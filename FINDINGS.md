@@ -92,3 +92,9 @@ Verified: `tests/test_channel_ws_security.py` — a connection on `/v1/channels/
 `glc/security/errors.py` adds `safe_detail`/`safe_http_error`: every place `/v1/chat`, `/v1/chat/batch`, `/v1/vision`, `/v1/embed`, `/v1/speak`, and `/v1/transcribe` used to put a raw upstream exception (`str(e)`) straight into the HTTP response now logs the full exception server-side against a short incident id and returns only `"<context> failed (incident <id>)"` to the caller. `glc.db.log_call`'s `error` column — never client-facing — already had the full detail; this closes the client-facing leak specifically.
 
 Verified live: re-running the exact A1 curl against unfixed code returned the raw Gemini error body (`API_KEY_INVALID`, `generativelanguage.googleapis.com`); against fixed code (`tests/test_generic_errors.py` plus a direct in-process rerun) the same failure now returns `{"detail": "provider gemini failed (incident 219b8c8e)"}` while the full detail lands in the server log under that incident id.
+
+### Leak 2 — audit log writable at the OS layer (invariant 7, named explicitly)
+
+`glc/audit/schema.sql` now defines `BEFORE DELETE` and `BEFORE UPDATE` triggers on `audit_log` that `RAISE(ABORT, ...)`. This moves the append-only guarantee from "the Python wrapper class doesn't expose a `delete()` method" (which any other code opening the same SQLite file with the stdlib `sqlite3` module bypassed trivially) to the database file itself — SQLite enforces it for any connection, in-process or not.
+
+Verified: `harness/leak_runner.py` leak 2, which previously reported `OPEN -> DELETE succeeded: 1 rows -> 0 rows`, now reports `ERROR -> IntegrityError: audit_log is append-only: DELETE is not permitted`. `tests/test_audit_log.py` adds matching DELETE and UPDATE regression tests.

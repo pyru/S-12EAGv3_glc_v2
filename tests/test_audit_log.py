@@ -3,8 +3,12 @@ no-update/no-delete surface."""
 
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from glc.audit import store
-from glc.audit.store import AuditStore, append, init_store, query, schema_version
+from glc.audit.store import AuditStore, _resolve_path, append, init_store, query, schema_version
 
 
 def test_init_then_append():
@@ -39,6 +43,37 @@ def test_store_exposes_no_update_or_delete():
     public = [n for n in dir(s) if not n.startswith("_")]
     assert "append" in public
     assert len([n for n in public if n in ("update", "delete", "modify")]) == 0
+
+
+def test_delete_from_audit_log_is_blocked_at_the_db_layer():
+    """Section 7 leak 2: sqlite3.connect(...).execute("DELETE FROM
+    audit_log") from any in-process code — not just glc.audit.store's
+    own API. The append-only guarantee must hold at the database layer,
+    not only because glc's Python wrapper doesn't expose a delete()."""
+    init_store()
+    append(channel="x", channel_user_id="1", trust_level="owner_paired", event_type="probe")
+    assert len(query(limit=10)) == 1
+
+    conn = sqlite3.connect(_resolve_path())
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM audit_log")
+        conn.commit()
+    conn.close()
+
+    assert len(query(limit=10)) == 1
+
+
+def test_update_of_audit_log_is_blocked_at_the_db_layer():
+    init_store()
+    append(channel="x", channel_user_id="1", trust_level="owner_paired", event_type="probe")
+
+    conn = sqlite3.connect(_resolve_path())
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("UPDATE audit_log SET event_type='tampered'")
+        conn.commit()
+    conn.close()
+
+    assert query(limit=10)[0]["event_type"] == "probe"
 
 
 def test_schema_version_is_one():
