@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -36,6 +36,7 @@ from glc.llm_schemas import (
     VisionRequest,
 )
 from glc.routing import DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS
+from glc.security.auth import enforce_data_plane_limits, require_data_plane_credential
 
 DEFAULT_ORDER = ["ollama", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github"]
 ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
@@ -69,7 +70,7 @@ ROUTER_PROMPT = (
     "Output the single word and nothing else."
 )
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_data_plane_credential)])
 
 
 # ─────────────────────────── helpers (verbatim port) ──────────────────────────
@@ -344,7 +345,7 @@ def _validate_structured(text: str, schema: dict):
 # ─────────────────────────── routes ───────────────────────────
 
 
-@router.post("/v1/chat")
+@router.post("/v1/chat", dependencies=[Depends(enforce_data_plane_limits)])
 async def chat(req: ChatRequest, request: Request):
     state = request.app.state
     rtr = state.router
@@ -637,7 +638,7 @@ async def chat(req: ChatRequest, request: Request):
     raise HTTPException(503, f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}")
 
 
-@router.post("/v1/chat/batch")
+@router.post("/v1/chat/batch", dependencies=[Depends(enforce_data_plane_limits)])
 async def chat_batch(req: BatchChatRequest, request: Request):
     sem = _asyncio.Semaphore(max(1, req.max_concurrency))
 
@@ -654,7 +655,7 @@ async def chat_batch(req: BatchChatRequest, request: Request):
     return {"results": results}
 
 
-@router.post("/v1/vision")
+@router.post("/v1/vision", dependencies=[Depends(enforce_data_plane_limits)])
 async def vision(req: VisionRequest, request: Request):
     content: list[dict[str, Any]] = [{"type": "text", "text": req.prompt}]
     content.append({"type": "image_url", "image_url": {"url": req.image}})
@@ -676,7 +677,7 @@ async def vision(req: VisionRequest, request: Request):
     return await chat(inner, request)
 
 
-@router.post("/v1/embed")
+@router.post("/v1/embed", dependencies=[Depends(enforce_data_plane_limits)])
 async def embed(req: EmbedRequest, request: Request):
     from glc import embedders as E
 

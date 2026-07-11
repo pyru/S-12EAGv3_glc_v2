@@ -18,6 +18,15 @@ def _isolated_glc_state(monkeypatch, tmp_path):
     monkeypatch.setenv("GLC_AUDIT_DB", str(tmp_path / "audit.sqlite"))
     monkeypatch.setenv("GLC_PAIRING_DB", str(tmp_path / "pairings.sqlite"))
     monkeypatch.setenv("GLC_GATEWAY_DB", str(tmp_path / "gateway.sqlite"))
+    # Test-only: enable route introspection and set the two secrets the
+    # data-plane credential mechanism needs. Production never sets
+    # GLC_DEBUG_DOCS; see glc.main.create_app.
+    monkeypatch.setenv("GLC_DEBUG_DOCS", "1")
+    monkeypatch.setenv("GLC_CREDENTIAL_SIGNING_KEY", "test-signing-key")
+    monkeypatch.setenv("GLC_ADAPTER_BOOTSTRAP_KEY", "test-bootstrap-key")
+    import glc.security.credentials as _c
+
+    _c._used_nonces = {}
 
     # Reset singletons that cache config-dir at first access.
     import glc.config as _cfg
@@ -55,3 +64,21 @@ def install_token(app_client):
     from glc.config import install_token_path
 
     return install_token_path().read_text().strip()
+
+
+@pytest.fixture
+def data_plane_headers(app_client):
+    """A fresh, single-use Authorization header for one data-plane call,
+    minted the same way a real adapter would: via the bootstrap-key-
+    gated /v1/internal/credential endpoint. Mint a new one per call —
+    the credential is single-use by design."""
+
+    def _mint():
+        r = app_client.post(
+            "/v1/internal/credential",
+            headers={"Authorization": "Bearer test-bootstrap-key"},
+        )
+        token = r.json()["token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    return _mint

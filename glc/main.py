@@ -10,6 +10,7 @@ import signal
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -28,6 +29,7 @@ from glc.policy import reload_engine  # noqa: E402
 from glc.routes import channels as channels_route  # noqa: E402
 from glc.routes import chat as chat_route  # noqa: E402
 from glc.routes import control as control_route  # noqa: E402
+from glc.routes import internal as internal_route  # noqa: E402
 from glc.routes import speak as speak_route  # noqa: E402
 from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
@@ -73,33 +75,65 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="GLC v1 — Gateway for LLMs and Channels", lifespan=lifespan)
+def create_app(mode: Literal["full", "gateway", "control"] = "full") -> FastAPI:
+    """`mode` decides which routers — and therefore which secrets this
+    process needs — get mounted.
 
-app.include_router(chat_route.router)
-app.include_router(transcribe_route.router)
-app.include_router(speak_route.router)
-app.include_router(control_route.router)
-app.include_router(channels_route.router)
+    - "gateway": the data plane (chat/vision/embed/speak/transcribe +
+      the info-disclosure reads + the internal credential minter). Needs
+      glc-llm-keys and the credential-signing key. Never needs the
+      install token or any channel-specific secret.
+    - "control": the control plane and channel adapters (kill/pair/
+      presence + the channel webhook/WS routes). Needs the install
+      token, per-channel secrets, and the credential-signing key's
+      bootstrap half — never glc-llm-keys. A component compromised here
+      (leak 1, leak 6) simply has no provider key in its environment to
+      steal (invariant 1).
+    - "full": both, in one process — the default for local dev
+      (`uv run glc serve`) and the existing test suite, which was
+      written against a single combined app. `modal_app.py` deploys
+      "gateway" and "control" as two separate Modal Functions with two
+      separate Secrets instead of "full".
 
-
-@app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return (
-        "<html><body style='font-family:sans-serif;max-width:680px;margin:2em auto'>"
-        "<h1>GLC v1</h1>"
-        "<p>Gateway for LLMs and Channels — Session 11 scaffold.</p>"
-        "<p>Open <code>/docs</code> for the OpenAPI explorer.</p>"
-        "<p>Channel adapters connect over <code>WS /v1/channels/&lt;name&gt;</code>."
-        " V9 callers should point at this port unchanged: chat, vision, embed,"
-        " batch, cost-by-agent, providers, capabilities, status, calls."
-        "</p>"
-        "</body></html>"
+    Swagger/OpenAPI (`/docs`, `/openapi.json`) are only mounted when
+    GLC_DEBUG_DOCS=1 — closing the free route-map reconnaissance a
+    public, unauthenticated /openapi.json otherwise hands an attacker.
+    """
+    docs_enabled = os.getenv("GLC_DEBUG_DOCS") == "1"
+    application = FastAPI(
+        title="GLC v1 — Gateway for LLMs and Channels",
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
 
+    if mode in ("full", "gateway"):
+        application.include_router(chat_route.router)
+        application.include_router(transcribe_route.router)
+        application.include_router(speak_route.router)
+        application.include_router(internal_route.router)
+    if mode in ("full", "control"):
+        application.include_router(control_route.router)
+        application.include_router(channels_route.router)
 
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True, "port": PORT}
+    @application.get("/", response_class=HTMLResponse)
+    async def index() -> str:
+        return (
+            "<html><body style='font-family:sans-serif;max-width:680px;margin:2em auto'>"
+            "<h1>GLC v1</h1>"
+            f"<p>Gateway for LLMs and Channels — mode={mode}.</p>"
+            "</body></html>"
+        )
+
+    @application.get("/healthz")
+    async def healthz():
+        return {"ok": True, "port": PORT, "mode": mode}
+
+    return application
+
+
+app = create_app("full")
 
 
 if __name__ == "__main__":
