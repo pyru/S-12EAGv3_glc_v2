@@ -121,3 +121,37 @@ What is genuinely implemented here, and does hold:
 2. **Detection instead of silence.** `glc/main.py` independently captures its own reference at process start and runs a background watchdog (`check_policy_integrity_once`, polled every `GLC_POLICY_INTEGRITY_INTERVAL_S` seconds, default 10) that compares the live bindings against both captured references. A mismatch — including the exact literal free-function rebind — is recorded to the audit log as `policy_engine_tampered`. Because leak 2 is now closed, the same attacker who tampered with the policy engine can no longer erase that record.
 
 Verified: `harness/leak_runner.py` leak 5 now reports both halves honestly — the rebind still bypasses enforcement (expected, not preventable), and `check_policy_integrity_once()` detects and durably records it. `tests/test_policy_engine_integrity.py` covers the class-rebind-survival case, the detector's true/false states, and that detection reaches the audit log.
+
+### A3, A4, leak 1, leak 6 — the shared Secret / no egress wall (invariant 1)
+
+`modal_app.py` now deploys **two** Modal Functions built from the same `glc.main.create_app(mode=...)` factory instead of one:
+
+- `fastapi_app` ("gateway"): the data plane. Secrets `glc-llm-keys` and `glc-signing-key`. Never mounts the install token or any channel secret.
+- `control_app` ("control"): the control plane and channel adapters. Secrets `glc-channel-secrets` and `glc-adapter-bootstrap`. **Never mounts `glc-llm-keys`.**
+
+This closes leak 1 and A4 for real, not just in application logic: `os.environ["GEMINI_API_KEY"]` in the control container raises `KeyError`, because that key is never in its environment at all — a guarantee Modal's `secrets=[...]` parameter enforces at the container level, not something `glc` code can accidentally reintroduce. `glc.main._make_lifespan` is mode-aware so a "gateway" process doesn't even attempt to build the state ("control" secrets, install token) it no longer has.
+
+For A3/leak 6 (unbounded egress, no wall): the control container — the one a compromised channel adapter would run in — now has no provider key to exfiltrate in the first place, which is a materially different risk than "egress is unrestricted so a stolen key can leave." A true per-adapter network egress allowlist (Modal `Sandbox` with `outbound_domain_allowlist`) is not implemented: that API is scoped to `modal.Sandbox`, not the long-running `modal.Function`/ASGI-app model this gateway uses, and moving channel-adapter execution into short-lived Sandboxes is a bigger dispatch-model change than Part 1's timebox covers. This is a documented residual gap, not a claimed fix — C1's SSRF allowlist (invariant 2) closes the one concrete attacker-controlled egress path that exists today (`/v1/vision`'s image fetch).
+
+Verified live against the redeployed URLs:
+- `curl .../healthz` on both `https://pyramesh-ai--glc-v1-gateway-fastapi-app.modal.run` (`mode: "gateway"`) and `https://pyramesh-ai--glc-v1-gateway-control-app.modal.run` (`mode: "control"`).
+- `curl -X POST .../v1/control/kill` on the **gateway** URL → `404` (route doesn't exist there).
+- `curl -X POST .../v1/chat` on the **control** URL → `404` (route doesn't exist there).
+- Full mint-credential → `/v1/chat` round trip against the gateway URL succeeds through to a real (mock-key) provider error.
+- `tests/test_app_modes.py` covers the route-separation half in-process; the Secret-mounting half is a deployment fact verified above, not something a local test process can observe.
+
+### Leak 4 — install token readable in-process — honest scope note
+
+Partially improved, not closed. Since `glc.main._make_lifespan` is mode-aware, the **gateway** process never calls `get_or_create_install_token()` at all — it has no install token to read. The **control** process still creates and can read its own install token in-process (it needs to, to serve `/v1/control/*` and authenticate WS connections), and `os.kill`/loopback-based misuse of it is still reachable from inside that same container (leak 8, below). What changed is blast radius: a compromise limited to reading the install token no longer also grants reach into `glc-llm-keys`, `glc-signing-key`, or the data plane — those live in a separate container entirely.
+
+### Leak 7 / leak 8 — subprocess access and self-kill — honest scope note
+
+Not closed, contained. `subprocess.run(...)` and `os.kill(os.getpid(), signal.SIGTERM)` still work from wherever the calling code is running — a Python process can always do these while it's holding code execution, and no in-process code change removes that Python-level capability (the assignment's own text concedes this for leak 7: "removing the shell alone is never the whole answer"). What the two-Function split changes is scope: code running in the **control** container that calls `os.kill(os.getpid(), ...)` now only takes down the control plane and channel adapters — `/v1/chat` and the rest of the data plane, running in a separate Modal Function/container, keep serving. Before the split, one process was both.
+
+### A5 — non-reproducible image (no single invariant; supply-chain hygiene)
+
+`modal_app.py`'s image now pins every dependency to the exact version resolved by `uv.lock` at harden time (`fastapi==0.137.1`, `httpx==0.28.1`, `pydantic==2.13.4`, etc. — see the file for the full list) instead of `>=` ranges on a rolling `debian_slim` base. A rebuild today installs the same versions as a rebuild next month; bumping requires touching this file and `uv.lock` together, deliberately.
+
+### A6 — audit volume assumes one writer (invariant 7)
+
+Both Modal Functions are capped at `max_containers=1` (alongside the existing `min_containers=0` scale-to-zero). Each Function's SQLite files (`gateway.sqlite` on the data-plane side; `audit.sqlite`, `pairings.sqlite`, `install_token` on the control side) now only ever have one possible writer process at a time by construction — the concurrent-writer scenario A6 describes cannot occur. The tradeoff is no horizontal scaling, which is the right call for a single-student, scale-to-zero, free-tier deployment and would not be for a production multi-tenant one.

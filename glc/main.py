@@ -106,27 +106,45 @@ def _install_sighup_reload() -> None:
         pass
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    import asyncio
+def _make_lifespan(mode: Literal["full", "gateway", "control"]):
+    """A mode-specific lifespan, so "gateway" and "control" — deployed as
+    two separate Modal Functions writing to a shared Volume — don't both
+    open and write the same SQLite files they have no reason to touch.
+    That reduces exactly the kind of concurrent-writer risk finding A6
+    describes, on top of the Secret separation this split exists for."""
 
-    db.init()
-    init_audit()
-    get_or_create_install_token()
-    _install_sighup_reload()
-    app.state.cache = GeminiCache(ttl_seconds=300)
-    app.state.providers = P.build_providers(app.state.cache)
-    app.state.router = Router(app.state.providers, chat_route.ORDER)
-    app.state.router_providers = P.build_router_providers()
-    app.state.router_pool = RouterPool(app.state.router_providers, chat_route.ROUTER_ORDER)
-    app.state.embedders, app.state.embed_order = E.build_embedders()
-    app.state.started_at = time.time()
-    app.state.registered_channels = []
-    watchdog = asyncio.create_task(_policy_integrity_watchdog())
-    try:
-        yield
-    finally:
-        watchdog.cancel()
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        import asyncio
+
+        needs_data_plane = mode in ("full", "gateway")
+        needs_control_plane = mode in ("full", "control")
+
+        if needs_data_plane:
+            db.init()
+            app.state.cache = GeminiCache(ttl_seconds=300)
+            app.state.providers = P.build_providers(app.state.cache)
+            app.state.router = Router(app.state.providers, chat_route.ORDER)
+            app.state.router_providers = P.build_router_providers()
+            app.state.router_pool = RouterPool(app.state.router_providers, chat_route.ROUTER_ORDER)
+            app.state.embedders, app.state.embed_order = E.build_embedders()
+        if needs_control_plane:
+            init_audit()
+            get_or_create_install_token()
+            _install_sighup_reload()
+        app.state.started_at = time.time()
+        app.state.registered_channels = []
+        # Each Modal Function is its own process with its own copy of
+        # glc.policy.engine's module state, so the watchdog runs
+        # regardless of mode — a container split already contains leak
+        # 5's blast radius to whichever process was actually tampered.
+        watchdog = asyncio.create_task(_policy_integrity_watchdog())
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+
+    return lifespan
 
 
 def create_app(mode: Literal["full", "gateway", "control"] = "full") -> FastAPI:
@@ -156,7 +174,7 @@ def create_app(mode: Literal["full", "gateway", "control"] = "full") -> FastAPI:
     docs_enabled = os.getenv("GLC_DEBUG_DOCS") == "1"
     application = FastAPI(
         title="GLC v1 — Gateway for LLMs and Channels",
-        lifespan=lifespan,
+        lifespan=_make_lifespan(mode),
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,
         openapi_url="/openapi.json" if docs_enabled else None,

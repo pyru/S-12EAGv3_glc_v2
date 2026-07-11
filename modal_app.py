@@ -1,11 +1,30 @@
-"""
-Modal deployment wrapper for glc_v1  (Session 12, Move 1: wrap the gateway).
+"""Modal deployment wrapper for glc_v1 (Session 12, hardened past Move 1).
 
-This file changes NO application code. It only describes, for Modal:
-  1. the container image to build,
-  2. a persistent Volume for the ~/.glc config/db folder,
-  3. a Secret that supplies the provider keys as environment variables,
-  4. which object to serve  ->  the existing FastAPI app, glc.main:app.
+Move 1 wrapped the whole gateway as a single Function with one shared
+Secret — every finding in Section 6 group A and Section 7 traces back to
+that. This file deploys two separate Modal Functions instead, built from
+the same glc.main.create_app(mode=...) factory:
+
+  - fastapi_app / "gateway": the data plane (chat/vision/embed/speak/
+    transcribe + the info-disclosure reads + the internal credential
+    minter). Gets glc-llm-keys and glc-credential-signing-key. Never
+    gets the install token or any channel-specific secret.
+  - control_app / "control": the control plane and channel adapters
+    (kill/pair/presence + the channel webhook/WS routes). Gets
+    glc-channel-secrets and glc-adapter-bootstrap. Never gets
+    glc-llm-keys — closes A4/leak 1 (adapters reading provider keys via
+    the shared process environment) and shrinks leak 6's (unbounded
+    egress) blast radius to a container that has no provider keys to
+    exfiltrate in the first place.
+
+Both Functions share the persistent Volume (their SQLite files don't
+overlap: gateway owns gateway.sqlite, the cost ledger; control owns
+audit.sqlite, pairings.sqlite, and install_token) and are capped at
+max_containers=1 — closing A6 (concurrent containers writing the same
+SQLite file with no coordinated single writer) by construction, at the
+cost of no horizontal scaling. That's the right tradeoff for a
+single-student, scale-to-zero, free-tier deployment; it would not be
+for a production multi-tenant one.
 
 Deploy with:   uv run modal deploy modal_app.py
 """
@@ -14,58 +33,94 @@ from pathlib import Path
 
 import modal
 
-# The Modal "app" is just a namespace for everything we deploy under this name.
 app = modal.App("glc-v1-gateway")
 
-# Path to the glc package next to this file. We copy the whole package (not just
-# .py files) so its data files travel too: policy.yaml, channels.yaml,
-# audit/schema.sql, and the channel catalogue.
 LOCAL_GLC = Path(__file__).parent / "glc"
 
-# The image = a Linux box with Python 3.11, the same dependencies as
-# pyproject.toml, the glc package copied in, and GLC_CONFIG_DIR pointed at the
-# Volume mount so all databases land on persistent storage instead of the
-# throwaway container filesystem.
+# Pinned to the exact versions resolved by uv.lock at the time this was
+# hardened (A5: modal_app.py previously built on rolling debian_slim
+# with >= dep ranges, drifting out from under uv.lock on every rebuild —
+# a supply-chain hygiene gap that widens the blast radius of every other
+# finding here). Bump deliberately, together with uv.lock, not silently.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.27",
-        "httpx>=0.27",
-        "python-dotenv>=1.0",
-        "pydantic>=2.6",
-        "jsonschema>=4.21",
-        "pyyaml>=6.0",
-        "websockets>=12.0",
-        "twilio>=9.0",
+        "fastapi==0.137.1",
+        "uvicorn[standard]==0.49.0",
+        "httpx==0.28.1",
+        "python-dotenv==1.2.2",
+        "pydantic==2.13.4",
+        "jsonschema==4.26.0",
+        "pyyaml==6.0.3",
+        "websockets==16.0",
+        "twilio==9.10.9",
     )
     .env({"GLC_CONFIG_DIR": "/data/glc"})
     .add_local_dir(str(LOCAL_GLC), remote_path="/root/glc")
 )
 
-# A persistent Volume. The audit db, pairing db, and install token live here and
-# survive restarts and redeploys. Without this, every restart wipes them.
 data_volume = modal.Volume.from_name("glc-data", create_if_missing=True)
 
-# The provider keys, injected as environment variables at runtime. Created
-# separately with `modal secret create glc-llm-keys ...` (mock values for now).
+# Provider keys — gateway only. Created with `modal secret create
+# glc-llm-keys ...` (mock values).
 llm_secret = modal.Secret.from_name("glc-llm-keys")
+
+# The credential-signing key gateway uses to mint and verify the
+# short-lived, single-use, tool-scoped credentials that authenticate
+# data-plane calls (glc/security/credentials.py) — gateway only. Created
+# with `modal secret create glc-signing-key GLC_CREDENTIAL_SIGNING_KEY=...`.
+signing_secret = modal.Secret.from_name("glc-signing-key")
+
+# The bootstrap key a low-trust component presents to request a scoped
+# data-plane credential (POST /v1/internal/credential) — shared between
+# gateway (to verify the request) and control (to make it). Deliberately
+# its own secret: holding it lets you ask for one credential at a time,
+# it does not by itself grant provider-key access. Created with
+# `modal secret create glc-adapter-bootstrap GLC_ADAPTER_BOOTSTRAP_KEY=...`.
+bootstrap_secret = modal.Secret.from_name("glc-adapter-bootstrap")
+
+# Per-channel tokens (Telegram/Discord/Twilio/... bot tokens, webhook
+# shared secrets) — control only; gateway never sees these either.
+# Created with `modal secret create glc-channel-secrets ...` (mock
+# values — this deployment doesn't register live channel adapters).
+channel_secret = modal.Secret.from_name("glc-channel-secrets")
 
 
 @app.function(
     image=image,
     volumes={"/data": data_volume},
-    secrets=[llm_secret],
-    min_containers=0,  # scale to zero when idle -> protects the free tier
+    secrets=[llm_secret, signing_secret, bootstrap_secret],
+    min_containers=0,
+    max_containers=1,  # A6: one writer for gateway.sqlite, no exceptions
 )
 @modal.asgi_app()
 def fastapi_app():
-    """Serve the unchanged glc_v1 FastAPI app."""
+    """The public data plane. Holds provider keys; never holds the
+    install token or a channel secret."""
     import os
 
-    # The gateway writes its databases and install token here on startup, so the
-    # folder must exist on the mounted Volume before the app's lifespan runs.
     os.makedirs("/data/glc", exist_ok=True)
 
-    from glc.main import app as web  # the real glc_v1 app, imported as-is
-    return web
+    from glc.main import create_app
+
+    return create_app(mode="gateway")
+
+
+@app.function(
+    image=image,
+    volumes={"/data": data_volume},
+    secrets=[channel_secret, bootstrap_secret],
+    min_containers=0,
+    max_containers=1,  # A6: one writer for audit.sqlite/pairings.sqlite
+)
+@modal.asgi_app()
+def control_app():
+    """The control plane and channel adapters. Holds the install token
+    and per-channel secrets; never holds a provider key."""
+    import os
+
+    os.makedirs("/data/glc", exist_ok=True)
+
+    from glc.main import create_app
+
+    return create_app(mode="control")
