@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse
 ROOT = Path(__file__).parent
 load_dotenv(ROOT.parent / ".env")  # repo .env, if present
 
+import glc.policy.engine as _policy_engine_module  # noqa: E402
 from glc import db  # noqa: E402
 from glc import embedders as E  # noqa: E402
 from glc import providers as P  # noqa: E402
@@ -35,6 +36,53 @@ from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
+
+# Captured here, at process start, independently of glc/policy/engine.py's
+# own internal capture — an out-of-band reference for the watchdog below.
+# See glc/policy/engine.py's _PRISTINE_EVALUATE docstring for why no
+# in-process code can *prevent* glc.policy.engine.evaluate being rebound
+# (Section 7 leak 5), only detect it after the fact.
+_PRISTINE_POLICY_EVALUATE = _policy_engine_module.evaluate
+
+POLICY_INTEGRITY_CHECK_INTERVAL_S = float(os.getenv("GLC_POLICY_INTEGRITY_INTERVAL_S", "10"))
+
+
+def check_policy_integrity_once() -> bool:
+    """Runs one tamper check. Returns True (and records an audit-log
+    entry) if either PolicyEngine.evaluate or glc.policy.engine.evaluate
+    no longer matches the reference captured at process start."""
+    from glc.audit import append as audit_append
+    from glc.policy.engine import is_tampered
+
+    tampered = is_tampered() or (_policy_engine_module.evaluate is not _PRISTINE_POLICY_EVALUATE)
+    if tampered:
+        audit_append(
+            channel="_system",
+            channel_user_id="policy_engine_watchdog",
+            trust_level="owner_paired",
+            event_type="policy_engine_tampered",
+            result={"detail": "PolicyEngine.evaluate or glc.policy.engine.evaluate was rebound at runtime"},
+        )
+        print("[glc] CRITICAL: policy engine tampering detected — recorded to audit log")
+    return tampered
+
+
+async def _policy_integrity_watchdog() -> None:
+    """Periodically, independently of whether anything actually calls
+    the policy engine, check whether it's been tampered with. This is a
+    detector, not a preventer — see the module-load-time capture above.
+    A positive hit is written to the audit log, which (since the leak 2
+    fix) the same in-process attacker can no longer erase."""
+    import asyncio
+
+    while True:
+        try:
+            await asyncio.sleep(POLICY_INTEGRITY_CHECK_INTERVAL_S)
+            check_policy_integrity_once()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # pragma: no cover
+            print(f"[glc] policy integrity watchdog error: {e!r}")
 
 
 def _install_sighup_reload() -> None:
@@ -60,6 +108,8 @@ def _install_sighup_reload() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+
     db.init()
     init_audit()
     get_or_create_install_token()
@@ -72,7 +122,11 @@ async def lifespan(app: FastAPI):
     app.state.embedders, app.state.embed_order = E.build_embedders()
     app.state.started_at = time.time()
     app.state.registered_channels = []
-    yield
+    watchdog = asyncio.create_task(_policy_integrity_watchdog())
+    try:
+        yield
+    finally:
+        watchdog.cancel()
 
 
 def create_app(mode: Literal["full", "gateway", "control"] = "full") -> FastAPI:

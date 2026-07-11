@@ -143,6 +143,29 @@ class PolicyEngine:
             self.config = new.config
 
 
+# Captured immediately at module-import time — before any other
+# in-process code, including an attacker's, has had a chance to run.
+# Section 7 leak 5 demonstrated `glc.policy.engine.evaluate = lambda
+# *_, **__: PolicyVerdict(action="allow", ...)`, which silently
+# disables enforcement for any caller doing a fresh `evaluate(...)`
+# attribute lookup afterward. There is no way to prevent that specific
+# rebind from inside this module — reassigning a module attribute is a
+# basic Python operation no in-process code can intercept or refuse;
+# real prevention needs the policy engine in its own process (see
+# docs/ARCHITECTURE.md's "What S12 works on"). What this module *can*
+# do: hold a reference to the real, pristine evaluate captured before
+# any tampering could occur, and detect — not prevent — a mismatch, so
+# the tamper attempt lands in the now-truly-append-only audit log
+# (leak 2's fix) instead of vanishing without a trace.
+_PRISTINE_EVALUATE = PolicyEngine.evaluate
+
+
+def is_tampered() -> bool:
+    """True if PolicyEngine.evaluate no longer matches the reference
+    captured at module import — i.e. something rebound it after boot."""
+    return PolicyEngine.evaluate is not _PRISTINE_EVALUATE
+
+
 # Module-level singleton, lazily constructed from config.policy_yaml_path().
 _engine: PolicyEngine | None = None
 _engine_lock = threading.Lock()
@@ -166,4 +189,15 @@ def reload_engine() -> None:
 
 
 def evaluate(tool_call: dict[str, Any], context: dict[str, Any]) -> PolicyVerdict:
-    return get_engine().evaluate(tool_call, context)
+    """The entry point real callers should use. Calls through
+    _PRISTINE_EVALUATE — the function object captured at import time —
+    rather than `get_engine().evaluate(...)`, which re-resolves
+    PolicyEngine.evaluate by attribute lookup on every call and would
+    happily run whatever that attribute currently points to. This
+    function name itself can still be rebound (leak 5's literal demo,
+    `glc.policy.engine.evaluate = lambda ...`) — no in-process code can
+    prevent that — but any caller that imported this function once,
+    early, and kept its own reference is unaffected by a later rebind,
+    same as this module is unaffected by PolicyEngine.evaluate being
+    reassigned after _PRISTINE_EVALUATE was captured."""
+    return _PRISTINE_EVALUATE(get_engine(), tool_call, context)

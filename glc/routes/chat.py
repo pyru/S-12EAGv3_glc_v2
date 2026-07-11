@@ -306,7 +306,7 @@ def _assert_public_host(hostname: str) -> None:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror as e:
         raise HTTPException(400, f"could not resolve image host {hostname!r}: {e}") from e
-    for family, _type, _proto, _canon, sockaddr in infos:
+    for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         if (
             ip.is_private
