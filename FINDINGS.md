@@ -57,6 +57,28 @@ All confirmed **OPEN** by `harness/leak_runner.py` against unmodified code (see 
 | 9 | Cross-channel envelope spoof (in-process WS reproduction, same bug as C2) | **I2** | R3 |
 | 10 | Cost-ledger poisoning (`glc.db.log_call(input_tokens=999_999_999, ...)`) | **I8** (named explicitly) — corrupts the ledger the invariant's hard limits would be computed from | R4 |
 
+## Final status (all fixes re-verified against the redeployed URLs)
+
+| Finding | Status | Re-verified |
+|---|---|---|
+| Recon, A1, A2 | **Closed** | live: 401/404 |
+| C5 (rate limit + budget) | **Closed** | tests |
+| C1 (SSRF) | **Closed** | live: 400, non-public address rejected |
+| C2 / leak 9 (channel spoof) | **Closed** | live: WS closed, code 1008 |
+| C3 (WS token in query) | **Closed** | live: query-string connection rejected, HTTP 403 |
+| C4 (verbose errors) | **Closed** | live: generic incident-keyed message |
+| C6 (pairing brute force) | **Not reproducible** | live: needs install token already |
+| Leak 2 (audit DELETE) | **Closed** | harness: IntegrityError |
+| Leak 3 (pairing escalation) | **Closed** | harness: PermissionError |
+| Leak 5 (policy monkeypatch) | **Detected, not preventable** | harness: tamper recorded to audit log |
+| Leak 10 (cost ledger poison) | **Closed** | harness: ValueError |
+| A3, A4, leak 1, leak 6 (shared Secret / egress) | **Closed** (A4/leak 1); **contained, not closed** (A3/leak 6 — documented residual) | live: two Functions, verified route + Secret separation |
+| Leak 4 (install token) | **Contained, not closed** | documented |
+| Leak 7 (subprocess) | **Contained, not closed** | documented |
+| Leak 8 (self-kill) | **Contained, not closed** | documented |
+| A5 (image pinning) | **Closed** | modal_app.py pins exact `uv.lock` versions |
+| A6 (single writer) | **Closed** | `max_containers=1` on both Functions |
+
 ## Fixes
 
 See commit history — one commit per finding (or tight cluster of findings sharing one mechanism), each naming the invariant it closes.
