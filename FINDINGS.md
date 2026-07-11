@@ -80,3 +80,9 @@ Verified: `tests/test_data_plane_auth.py::test_data_plane_rate_limit_trips` (31s
 `_assert_public_host` (`glc/routes/chat.py`) now resolves the image URL's hostname and rejects it if any resolved address is private, loopback, link-local, multicast, reserved, or unspecified (IPv4 and IPv6) — before any HTTP fetch is attempted. `follow_redirects` is now off; the fetcher instead follows redirects manually (max 5 hops), re-running the same host check on every hop, so a public URL cannot retarget the fetch to an internal address after the first check passes. A 10MB response cap was added as a low-cost companion guard against the same endpoint being used for resource exhaustion.
 
 Verified: `tests/test_vision_ssrf.py` — 8 private/link-local/loopback hosts (v4 and v6) all rejected with 400; a public IP passes; a `/v1/chat` call with an `image_url` pointed at `169.254.169.254` now returns 400 instead of reaching the fetch.
+
+### C2 / leak 9 — cross-channel envelope spoofing (invariant 2), and C3 — WS token in the query string (invariant 4)
+
+`glc/routes/channels.py`'s WS handler now compares `env.channel` to the route's `name` path segment on every inbound message; a mismatch closes the socket (`WS_1008`) and is audit-logged as `channel_mismatch`, rather than being sent back as a soft error and left connected. Separately, the `?token=` query-string fallback for WS auth is removed entirely — only the `Authorization: Bearer <token>` header authenticates the connection now, so the credential can no longer land in proxy access logs or browser history.
+
+Verified: `tests/test_channel_ws_security.py` — a connection on `/v1/channels/webui` declaring `channel="whatsapp"` gets its socket closed instead of echoed; a matching channel still works; `?token=` no longer authenticates a connection at all; the header path still does.

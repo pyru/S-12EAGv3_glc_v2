@@ -2,8 +2,9 @@
 
 Adapters connect over WebSocket and exchange JSON-serialised
 ChannelMessage and ChannelReply envelopes. The connection is gated by
-the installation token presented in the Authorization header (Sec-Websocket
-clients can pass it as a query string fallback, ?token=...).
+the installation token presented in the Authorization header only —
+there is deliberately no query-string fallback (see the module docstring
+note on C3 below).
 
 This endpoint is the contract surface adapters speak to. The gateway
 processes incoming messages through the rate limiter, allowlist,
@@ -18,7 +19,7 @@ import hmac
 import json
 import os
 
-from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from glc.audit import append as audit_append
@@ -33,13 +34,16 @@ router = APIRouter()
 
 
 @router.websocket("/v1/channels/{name}")
-async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(default=None)):
+async def channel_ws(websocket: WebSocket, name: str):
+    # Invariant 4: a credential must work only for one specific tool
+    # call — or, for a standing connection, be presented the one way it
+    # was meant to be. A query-string token (leak/finding C3) ends up in
+    # proxy access logs and browser history; header-only auth does not.
+    # There is no ?token= fallback here on purpose.
     header_auth = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
     presented = None
     if header_auth and header_auth.startswith("Bearer "):
         presented = header_auth.removeprefix("Bearer ").strip()
-    elif token:
-        presented = token
     expected = get_or_create_install_token()
     if presented != expected:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -65,6 +69,24 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
             except Exception as e:
                 await websocket.send_text(json.dumps({"error": f"invalid envelope: {e}"}))
                 continue
+
+            if env.channel != name:
+                # Invariant 2: the action must be checked against the
+                # actual caller — here, the route the caller authenticated
+                # on. A connection authenticated for /v1/channels/{name}
+                # does not get to declare itself a different channel
+                # (leak 9 / finding C2: cross-channel envelope spoofing).
+                # Close rather than just drop: a mismatch this blatant is
+                # not a message to retry, it's a caller to disconnect.
+                audit_append(
+                    channel=name,
+                    channel_user_id=env.channel_user_id,
+                    trust_level=env.trust_level,
+                    event_type="channel_mismatch",
+                    result={"route": name, "declared_channel": env.channel},
+                )
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
 
             ok, why = allowed(
                 env.channel,
