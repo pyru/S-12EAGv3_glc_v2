@@ -68,3 +68,9 @@ Every data-plane and info-disclosure route (`/v1/chat`, `/v1/chat/batch`, `/v1/v
 This also gives invariant 4 ("a credential must work only for one specific tool call") a real mechanism (`glc/security/credentials.py`): the token is bound to one tool name, expires in seconds, and is rejected on reuse (verified above: reusing a spent token returns 403).
 
 Verified: `curl .../v1/chat` and `curl .../openapi.json` now both fail closed before this fix would have let them through (see re-verification section below, run after redeploy).
+
+### C5 — rate limits and a hard daily token budget on the data plane (invariant 8)
+
+`require_data_plane_credential` now also runs every call through the existing per-caller `RateLimiter` (30 messages/minute by default, same limiter channel adapters already used), and the cost-incurring routes (`/v1/chat`, `/v1/chat/batch`, `/v1/vision`, `/v1/embed`, `/v1/speak`, `/v1/transcribe`) additionally depend on `enforce_data_plane_limits`, which rejects the call with `402` once the day's logged token usage (`glc.db.aggregate`) crosses `GLC_DAILY_TOKEN_BUDGET` (default 200,000).
+
+Verified: `tests/test_data_plane_auth.py::test_data_plane_rate_limit_trips` (31st call in a minute → 429) and `::test_data_plane_budget_exhausted_returns_402` (usage over the configured cap → 402), both passing.
