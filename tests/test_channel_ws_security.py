@@ -4,7 +4,7 @@ envelope spoofing) and C3 (auth token in the query string)."""
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def _envelope(channel: str, user_id: str = "u1", text: str = "hi") -> dict:
@@ -14,7 +14,7 @@ def _envelope(channel: str, user_id: str = "u1", text: str = "hi") -> dict:
         "user_handle": "u",
         "text": text,
         "trust_level": "untrusted",
-        "arrived_at": datetime.now(timezone.utc).isoformat(),
+        "arrived_at": datetime.now(UTC).isoformat(),
     }
 
 
