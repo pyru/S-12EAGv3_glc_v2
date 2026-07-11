@@ -86,3 +86,9 @@ Verified: `tests/test_vision_ssrf.py` — 8 private/link-local/loopback hosts (v
 `glc/routes/channels.py`'s WS handler now compares `env.channel` to the route's `name` path segment on every inbound message; a mismatch closes the socket (`WS_1008`) and is audit-logged as `channel_mismatch`, rather than being sent back as a soft error and left connected. Separately, the `?token=` query-string fallback for WS auth is removed entirely — only the `Authorization: Bearer <token>` header authenticates the connection now, so the credential can no longer land in proxy access logs or browser history.
 
 Verified: `tests/test_channel_ws_security.py` — a connection on `/v1/channels/webui` declaring `channel="whatsapp"` gets its socket closed instead of echoed; a matching channel still works; `?token=` no longer authenticates a connection at all; the header path still does.
+
+### C4 — verbose upstream errors (invariant 1)
+
+`glc/security/errors.py` adds `safe_detail`/`safe_http_error`: every place `/v1/chat`, `/v1/chat/batch`, `/v1/vision`, `/v1/embed`, `/v1/speak`, and `/v1/transcribe` used to put a raw upstream exception (`str(e)`) straight into the HTTP response now logs the full exception server-side against a short incident id and returns only `"<context> failed (incident <id>)"` to the caller. `glc.db.log_call`'s `error` column — never client-facing — already had the full detail; this closes the client-facing leak specifically.
+
+Verified live: re-running the exact A1 curl against unfixed code returned the raw Gemini error body (`API_KEY_INVALID`, `generativelanguage.googleapis.com`); against fixed code (`tests/test_generic_errors.py` plus a direct in-process rerun) the same failure now returns `{"detail": "provider gemini failed (incident 219b8c8e)"}` while the full detail lands in the server log under that incident id.

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from glc.security.auth import enforce_data_plane_limits, require_data_plane_credential
+from glc.security.errors import safe_http_error
 from glc.voice.tts import TTSError, synthesize
 
 router = APIRouter(dependencies=[Depends(require_data_plane_credential)])
@@ -33,7 +34,7 @@ async def speak_route(req: SpeakRequest):
     try:
         r = await synthesize(req.text, voice_id=req.voice_id, prefer=req.prefer)
     except TTSError as e:
-        raise HTTPException(e.status or 502, str(e)) from e
+        raise safe_http_error(e.status or 502, "speak", e) from e
     return SpeakResponse(
         audio_b64=r.audio_b64,
         mime=r.mime,

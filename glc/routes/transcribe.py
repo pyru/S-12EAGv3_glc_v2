@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from glc.security.auth import enforce_data_plane_limits, require_data_plane_credential
+from glc.security.errors import safe_http_error
 from glc.voice.stt import STTError, transcribe
 
 router = APIRouter(dependencies=[Depends(require_data_plane_credential)])
@@ -41,8 +42,8 @@ async def transcribe_route(req: TranscribeRequest):
         r = await transcribe(audio, req.mime, prefer=req.prefer)
     except STTError as e:
         if req.prefer == "streaming":
-            raise HTTPException(400, str(e)) from e
-        raise HTTPException(e.status or 502, str(e)) from e
+            raise safe_http_error(400, "transcribe", e) from e
+        raise safe_http_error(e.status or 502, "transcribe", e) from e
     return TranscribeResponse(
         text=r.text,
         language=r.language,
