@@ -74,3 +74,9 @@ Verified: `curl .../v1/chat` and `curl .../openapi.json` now both fail closed be
 `require_data_plane_credential` now also runs every call through the existing per-caller `RateLimiter` (30 messages/minute by default, same limiter channel adapters already used), and the cost-incurring routes (`/v1/chat`, `/v1/chat/batch`, `/v1/vision`, `/v1/embed`, `/v1/speak`, `/v1/transcribe`) additionally depend on `enforce_data_plane_limits`, which rejects the call with `402` once the day's logged token usage (`glc.db.aggregate`) crosses `GLC_DAILY_TOKEN_BUDGET` (default 200,000).
 
 Verified: `tests/test_data_plane_auth.py::test_data_plane_rate_limit_trips` (31st call in a minute → 429) and `::test_data_plane_budget_exhausted_returns_402` (usage over the configured cap → 402), both passing.
+
+### C1 — SSRF in the vision image-url resolver (invariant 2)
+
+`_assert_public_host` (`glc/routes/chat.py`) now resolves the image URL's hostname and rejects it if any resolved address is private, loopback, link-local, multicast, reserved, or unspecified (IPv4 and IPv6) — before any HTTP fetch is attempted. `follow_redirects` is now off; the fetcher instead follows redirects manually (max 5 hops), re-running the same host check on every hop, so a public URL cannot retarget the fetch to an internal address after the first check passes. A 10MB response cap was added as a low-cost companion guard against the same endpoint being used for resource exhaustion.
+
+Verified: `tests/test_vision_ssrf.py` — 8 private/link-local/loopback hosts (v4 and v6) all rejected with 400; a public IP passes; a `/v1/chat` call with an `image_url` pointed at `169.254.169.254` now returns 400 instead of reaching the fetch.

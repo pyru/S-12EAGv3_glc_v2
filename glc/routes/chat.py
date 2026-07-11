@@ -286,8 +286,41 @@ def _required_caps(req: ChatRequest):
     return caps
 
 
+_IMAGE_FETCH_MAX_BYTES = 10 * 1024 * 1024
+_IMAGE_FETCH_MAX_REDIRECTS = 5
+
+
+def _assert_public_host(hostname: str) -> None:
+    """Invariant 2: the final argument (the image URL) must be checked
+    before the gateway acts on it. Reject any hostname that resolves to
+    a private, loopback, link-local, multicast, reserved, or unspecified
+    address — cloud metadata endpoints (169.254.169.254) and internal
+    services included. Checked again on every redirect hop, since
+    following a redirect blindly would otherwise let a public URL
+    retarget the fetch after this check has already passed once."""
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise HTTPException(400, f"could not resolve image host {hostname!r}: {e}") from e
+    for family, _type, _proto, _canon, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise HTTPException(400, f"image url {hostname!r} resolves to a non-public address ({ip}); refused")
+
+
 async def _resolve_image_urls(messages):
     import base64
+    from urllib.parse import urljoin, urlparse
 
     import httpx as _httpx
 
@@ -296,15 +329,32 @@ async def _resolve_image_urls(messages):
             "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
             "Accept": "image/*,*/*;q=0.8",
         }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
-            try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+        current = url
+        async with _httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as c:
+            for _ in range(_IMAGE_FETCH_MAX_REDIRECTS + 1):
+                parsed = urlparse(current)
+                if parsed.scheme not in ("http", "https"):
+                    raise HTTPException(400, f"unsupported image url scheme: {parsed.scheme!r}")
+                if not parsed.hostname:
+                    raise HTTPException(400, f"image url has no host: {current!r}")
+                _assert_public_host(parsed.hostname)
+                try:
+                    r = await c.get(current)
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {current!r}: {e}") from e
+                if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+                    current = urljoin(current, r.headers["location"])
+                    continue
+                try:
+                    r.raise_for_status()
+                except _httpx.HTTPStatusError as e:
+                    raise HTTPException(400, f"failed to fetch image url {current!r}: {e}") from e
+                if len(r.content) > _IMAGE_FETCH_MAX_BYTES:
+                    raise HTTPException(400, f"image at {current!r} exceeds {_IMAGE_FETCH_MAX_BYTES} byte limit")
+                mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
+                b64 = base64.b64encode(r.content).decode()
+                return f"data:{mt};base64,{b64}"
+            raise HTTPException(400, f"too many redirects fetching image url {url!r}")
 
     out = []
     for m in messages:
