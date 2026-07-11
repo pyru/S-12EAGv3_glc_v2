@@ -189,7 +189,25 @@ class PairingStore:
     ) -> PairingRecord:
         """Out-of-band pairing for the installation owner. Used by the
         installer to bootstrap the first owner identity. Not exposed
-        through HTTP."""
+        through HTTP.
+
+        Invariant 2: an action must be checked against the actual user
+        — including this one. Section 7 leak 3 demonstrated that, once
+        a channel already has an owner, any in-process caller could
+        still call this method to grant a *second*, attacker-chosen
+        identity owner_paired trust with no check at all. This method
+        now only succeeds on genuine first-run bootstrap (no existing
+        owner on this channel); re-pairing an owner after that requires
+        the explicit operator override GLC_ALLOW_REPAIR_OWNER=1, which
+        is a deployment-config decision, not something reachable by
+        ordinary in-process code."""
+        import os
+
+        if self.owners(channel=channel) and os.getenv("GLC_ALLOW_REPAIR_OWNER") != "1":
+            raise PermissionError(
+                f"channel {channel!r} already has an owner; force_pair_owner only bootstraps "
+                "the first owner. Set GLC_ALLOW_REPAIR_OWNER=1 to intentionally re-pair."
+            )
         paired_at = time.time()
         with _conn() as c:
             c.execute(

@@ -98,3 +98,9 @@ Verified live: re-running the exact A1 curl against unfixed code returned the ra
 `glc/audit/schema.sql` now defines `BEFORE DELETE` and `BEFORE UPDATE` triggers on `audit_log` that `RAISE(ABORT, ...)`. This moves the append-only guarantee from "the Python wrapper class doesn't expose a `delete()` method" (which any other code opening the same SQLite file with the stdlib `sqlite3` module bypassed trivially) to the database file itself — SQLite enforces it for any connection, in-process or not.
 
 Verified: `harness/leak_runner.py` leak 2, which previously reported `OPEN -> DELETE succeeded: 1 rows -> 0 rows`, now reports `ERROR -> IntegrityError: audit_log is append-only: DELETE is not permitted`. `tests/test_audit_log.py` adds matching DELETE and UPDATE regression tests.
+
+### Leak 3 — pairing escalation via `force_pair_owner` (invariant 2)
+
+`force_pair_owner` (`glc/security/pairing.py`) now checks whether the target channel already has an owner before granting `owner_paired`; if one exists, it raises `PermissionError` unless the deployment operator has explicitly set `GLC_ALLOW_REPAIR_OWNER=1`. This closes the realistic threat (an already-bootstrapped install getting a second, attacker-chosen owner identity slipped in) while still allowing genuine first-run bootstrap, which every existing test and installer flow depends on.
+
+Verified: `harness/leak_runner.py` leak 3 (updated to bootstrap a real owner first, matching the realistic post-install state) now reports `ERROR -> PermissionError: channel 'telegram' already has an owner...` instead of granting the attacker `owner_paired`. `tests/test_pairing.py` adds regression tests for bootstrap-still-works, escalation-now-blocked, and the explicit override.

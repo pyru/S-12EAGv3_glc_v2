@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from glc.security.pairing import CODE_TTL_SECONDS, PairingStore
 
 
@@ -12,6 +14,32 @@ def test_issue_code_is_six_digits():
     code, exp = store.issue_code("telegram", "42", "me")
     assert len(code) == 6 and code.isdigit()
     assert exp > time.time()
+
+
+def test_force_pair_owner_bootstraps_first_owner():
+    store = PairingStore()
+    rec = store.force_pair_owner("telegram", "real-owner")
+    assert rec.trust_level == "owner_paired"
+
+
+def test_force_pair_owner_rejects_escalation_once_owner_exists(monkeypatch):
+    """Section 7 leak 3: once a channel has an owner, force_pair_owner
+    must not let a second, unrelated identity grab owner_paired too."""
+    monkeypatch.delenv("GLC_ALLOW_REPAIR_OWNER", raising=False)
+    store = PairingStore()
+    store.force_pair_owner("telegram", "real-owner")
+    with pytest.raises(PermissionError, match="already has an owner"):
+        store.force_pair_owner("telegram", "attacker-id", user_handle="me")
+    owners = [o.channel_user_id for o in store.owners(channel="telegram")]
+    assert owners == ["real-owner"]
+
+
+def test_force_pair_owner_allows_explicit_repair_override(monkeypatch):
+    monkeypatch.setenv("GLC_ALLOW_REPAIR_OWNER", "1")
+    store = PairingStore()
+    store.force_pair_owner("telegram", "real-owner")
+    rec = store.force_pair_owner("telegram", "new-owner")
+    assert rec.trust_level == "owner_paired"
 
 
 def test_confirm_creates_pairing():
